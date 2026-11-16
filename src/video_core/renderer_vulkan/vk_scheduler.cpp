@@ -609,6 +609,18 @@ void Scheduler::EndRenderPass()
             }
         });
 
+        if (const VkPipelineStageFlags stages = std::exchange(deferred_wfi_stages, 0)) {
+            // The guest's wait-for-idle (RasterizerVulkan::WaitForIdle) from inside the pass.
+            Record([stages](vk::CommandBuffer cmdbuf) {
+                static constexpr VkMemoryBarrier WFI_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(stages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
+            });
+        }
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
         ++pass_epoch;
