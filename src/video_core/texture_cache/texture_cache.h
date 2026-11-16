@@ -453,7 +453,7 @@ void TextureCache<P>::TickFrame() {
                 if (budget > 2_GiB || (budget != 0 && NativeTextureCacheBudgetEnabled())) {
                     native_heap_budget = budget;
                     const u64 old_critical = critical_memory;
-                    const u64 margin = (std::min)(budget / 8, 1_GiB);
+                    const u64 margin = Settings::GetVramReserve(budget);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
                         // blocks, which the driver counts and a full heap cannot hand to a new
