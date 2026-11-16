@@ -1200,6 +1200,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
     }
+    // Depth writes, or a stencil test (its operations can write): what the feedback loop
+    // barrier (TextureCacheRuntime::BarrierFeedbackLoop) has to make visible.
+    if (maxwell3d->regs.zeta_enable != 0 &&
+        (maxwell3d->regs.depth_write_enabled != 0 || maxwell3d->regs.stencil_enable != 0)) {
+        scheduler.NoteDepthStencilWrite();
+    }
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         const auto& regs{maxwell3d->regs};

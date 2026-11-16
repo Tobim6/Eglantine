@@ -129,6 +129,17 @@ public:
         render_pass_has_stores = true;
     }
 
+    /// A draw or clear of the active render pass may write its depth/stencil attachment.
+    void NoteDepthStencilWrite() {
+        render_pass_depth_written = true;
+    }
+
+    /// Whether the active render pass may have written its depth/stencil attachment (a clear
+    /// when it began, or a draw or clear since).
+    [[nodiscard]] bool RenderPassWroteDepthStencil() const {
+        return render_pass_depth_written;
+    }
+
     bool RenderPassHasStores() const {
         return render_pass_has_stores;
     }
@@ -517,6 +528,7 @@ private:
     std::unique_ptr<MasterSemaphore> master_semaphore;
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    bool render_pass_depth_written{};
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;

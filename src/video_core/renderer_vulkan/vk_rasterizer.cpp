@@ -1798,6 +1798,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
             cmdbuf.ClearAttachments(attachment, clear_rect);
         });
     }
+    // The depth/stencil attachment was written (BarrierFeedbackLoop).
+    scheduler.NoteDepthStencilWrite();
 }
 
 namespace {
