@@ -227,6 +227,20 @@ public:
         (void)chunk->Record(command);
     }
 
+    /// Whether a buffer upload can run before the active render pass (RecordBeforeRenderPass,
+    /// Upload stage) instead of ending it. The caller checks that no draw of the pass used the
+    /// destination (Buffer::IsRegionUsedInPass).
+    [[nodiscard]] bool CanHoistUpload() const {
+        return pass_held && state.renderpass != VK_NULL_HANDLE &&
+               deferred_clear.framebuffer == nullptr;
+    }
+
+    /// Changes when a render pass ends: usage marked since then is usage by the current (or
+    /// next) render pass, including the bindings of its first draw, made before it begins.
+    [[nodiscard]] u64 PassEpoch() const noexcept {
+        return pass_epoch;
+    }
+
     /// Whether work recorded with RecordBeforeRenderPass runs before the render pass that is
     /// active on `framebuffer` (mesh emulation dispatches then do not end it).
     [[nodiscard]] bool CanRecordBeforeRenderPass(VkFramebuffer framebuffer) const {
@@ -238,9 +252,10 @@ public:
     /// Stages of the work recorded before a render pass. The work of all a pass's emulated mesh
     /// draws runs stage by stage, with one barrier between stages (not 2-4 per draw).
     enum class PrePassStage : u32 {
-        Task = 0,         ///< task program dispatches
-        Distribution = 1, ///< task -> mesh distribution dispatches (read the task output)
-        Mesh = 2,         ///< mesh program dispatches (read the distribution output)
+        Upload = 0,       ///< buffer uploads no draw of the pass has used yet (upload-hoist)
+        Task = 1,         ///< task program dispatches
+        Distribution = 2, ///< task -> mesh distribution dispatches (read the task output)
+        Mesh = 3,         ///< mesh program dispatches (read the distribution output)
     };
 
     /// Records work that runs before the active render pass begins (CanRecordBeforeRenderPass),
@@ -485,7 +500,8 @@ private:
     // targets on an RX 580).
     bool pass_held{};
     std::vector<std::unique_ptr<CommandChunk>> before_pass_chunks;
-    std::array<std::vector<std::unique_ptr<CommandChunk>>, 3> pre_pass_chunks;
+    std::array<std::vector<std::unique_ptr<CommandChunk>>, 4> pre_pass_chunks;
+    u64 pass_epoch{1};
     std::vector<std::unique_ptr<CommandChunk>> pass_chunks;
     /// Holds the render pass about to begin (BeginRenderPassImpl).
     void HoldPass();

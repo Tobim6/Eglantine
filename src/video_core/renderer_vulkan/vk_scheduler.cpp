@@ -608,6 +608,7 @@ void Scheduler::EndRenderPass()
 
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
+        ++pass_epoch;
         if (pass_held) {
             ReleasePass();
         }
@@ -694,12 +695,26 @@ void Scheduler::ReleasePass() {
     };
     std::vector<std::unique_ptr<CommandChunk>> pre_pass;
     bool any_stage = false;
-    for (size_t stage = 0; stage < pre_pass_chunks.size(); ++stage) {
+    bool any_compute = false;
+    constexpr size_t upload_stage = static_cast<size_t>(PrePassStage::Upload);
+    if (!pre_pass_chunks[upload_stage].empty()) {
+        // Uploads: after what earlier passes, dispatches and copies read and wrote.
+        pre_pass.push_back(barrier_chunk(
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT));
+        for (auto& held : pre_pass_chunks[upload_stage]) {
+            pre_pass.push_back(std::move(held));
+        }
+        pre_pass_chunks[upload_stage].clear();
+        any_stage = true;
+    }
+    for (size_t stage = upload_stage + 1; stage < pre_pass_chunks.size(); ++stage) {
         auto& chunks = pre_pass_chunks[stage];
         if (chunks.empty()) {
             continue;
         }
-        if (!any_stage) {
+        if (!any_compute) {
             // The programs read what earlier passes, dispatches and copies wrote (foliage
             // instance lists, for one).
             pre_pass.push_back(barrier_chunk(
@@ -717,21 +732,21 @@ void Scheduler::ReleasePass() {
                     VK_PIPELINE_STAGE_HOST_BIT));
         }
         any_stage = true;
+        any_compute = true;
         for (auto& held : chunks) {
             pre_pass.push_back(std::move(held));
         }
         chunks.clear();
     }
     if (any_stage) {
-        // The pass's draws read the mesh output in their vertex shaders, and their vertex
-        // counts as indirect arguments.
+        // The pass's draws read the mesh output in their vertex shaders and their vertex counts
+        // as indirect arguments, and the uploads as vertices, indices, uniforms and storage in
+        // any stage.
         pre_pass.push_back(barrier_chunk(
-            VK_ACCESS_SHADER_WRITE_BIT,
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
-                VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
-                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT));
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            vk::PIPELINE_STAGE_GRAPHICS_COMPUTE));
     }
     bool wake;
     {
