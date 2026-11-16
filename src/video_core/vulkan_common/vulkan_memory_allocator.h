@@ -171,6 +171,10 @@ namespace Vulkan {
         const VkPhysicalDeviceMemoryProperties properties; ///< Physical device memory properties.
         VkDeviceSize buffer_image_granularity;            ///< Adjacent buffer/image granularity
         u32 valid_memory_types{~0u};
+        /// Device-local memory types the CPU cannot see, when a discrete GPU also has CPU-visible
+        /// ones (resizable BAR); 0 otherwise. Images and GPU-only buffers try these first, so the
+        /// BAR memory stays for CPU-written buffers until the rest of the video memory is full.
+        u32 gpu_only_types{};
         mutable std::atomic<u32> pressure_events{0};
         mutable std::mutex buffer_type_mutex;
         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).

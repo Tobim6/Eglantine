@@ -1811,8 +1811,20 @@ u64 Device::GetDeviceMemorySlack() const {
     }
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
     vmaGetHeapBudgets(allocator, heap_budgets.data());
-    const VmaStatistics& statistics = heap_budgets[main_heap].statistics;
-    return statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
+    // Every heap images can live in (see GetDeviceMemoryBudget).
+    u64 result{};
+    for (const size_t heap : valid_heap_memory) {
+        if (heap == main_heap || (!is_integrated && IsImageHeap(heap))) {
+            const VmaStatistics& statistics = heap_budgets[heap].statistics;
+            result += statistics.blockBytes -
+                      (std::min)(statistics.blockBytes, statistics.allocationBytes);
+        }
+    }
+    return result;
+}
+
+bool Device::IsImageHeap(size_t heap) const {
+    return heap < VK_MAX_MEMORY_HEAPS && image_heaps[heap];
 }
 
 u64 Device::GetDeviceMemoryBudget() const {
@@ -1821,21 +1833,28 @@ u64 Device::GetDeviceMemoryBudget() const {
     }
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-    physical.GetMemoryProperties(&budget);
+    const auto mem_info = physical.GetMemoryProperties(&budget);
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
     if (allocator != nullptr) {
         vmaGetHeapBudgets(allocator, heap_budgets.data());
     }
-    // Only the main heap's budget: summing every heap's counted VRAM twice on AMD (an 8 GB card
-    // reported 8.5 GB) and kept the collector's thresholds above the heap the images fill. What
-    // the other heaps use is added the way GetDeviceMemoryUsage() counts it, so the usage reaches
-    // this when the main heap's does its budget.
-    u64 result = budget.heapBudget[main_heap];
-    if (heap_size_limit != 0) {
-        result = (std::min)(result, heap_size_limit);
-    }
+    // The budget of every device-local heap images can be placed in, as one pool. A discrete GPU
+    // can have more than one: with a partial resizable BAR an RX 580 8 GB has a 6 GiB heap and a
+    // 2 GiB CPU-visible one, and counting only the largest left the other unused (textures were
+    // evicted at ~4.9 GiB). Images take the CPU-visible heap once the other is full (see
+    // MemoryAllocator::CreateImage). Each heap counts at most its size, so the total never exceeds
+    // what the heaps hold. Other heaps (host memory) add what they use, the way
+    // GetDeviceMemoryUsage() counts it.
+    u64 result{};
     for (const size_t heap : valid_heap_memory) {
-        if (heap != main_heap) {
+        if (heap == main_heap || (!is_integrated && IsImageHeap(heap))) {
+            u64 heap_budget = (std::min)(budget.heapBudget[heap],
+                                         mem_info.memoryProperties.memoryHeaps[heap].size);
+            if (heap_size_limit != 0) {
+                heap_budget = (std::min)(heap_budget, heap_size_limit);
+            }
+            result += heap_budget;
+        } else {
             result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
         }
     }
@@ -1890,10 +1909,15 @@ void Device::CollectPhysicalMemoryInfo() {
             heap_size = limit(heap_size);
             local_memory += heap_size;
         }
+        // Every device-local heap (a resizable BAR one too) is part of the video memory pool
+        // (GetDeviceMemoryBudget).
+        image_heaps[element] = is_heap_local;
         if (extensions.memory_budget) {
             device_initial_usage += budget.heapUsage[element];
-            device_access_memory += is_heap_local ? limit(budget.heapBudget[element])
-                                                  : budget.heapBudget[element];
+            // At most the heap's size: a budget past it would be counted twice.
+            const u64 heap_budget = (std::min)(budget.heapBudget[element],
+                                               mem_properties.memoryHeaps[element].size);
+            device_access_memory += is_heap_local ? limit(heap_budget) : heap_budget;
             continue;
         }
         device_access_memory += heap_size;

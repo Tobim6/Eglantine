@@ -1084,6 +1084,10 @@ FN_MAX_LIMIT_LIST
     /// subtracted: see GetDeviceMemorySlack().
     u64 GetDeviceMemoryBudget() const;
 
+    /// Whether a heap is device-local video memory images can be placed in (the main heap and,
+    /// on a discrete GPU, a resizable BAR one).
+    bool IsImageHeap(size_t heap) const;
+
     /// Memory the allocator holds from the driver in the main device-local heap but has no
     /// allocation in (the unused part of its blocks). GetDeviceMemoryUsage() does not count it,
     /// yet the driver does: with the heap at its budget it is not available to new images.
@@ -1388,6 +1392,7 @@ private:
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
     bool streamline_attached{};   ///< Streamline has this device.
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
+    std::array<bool, VK_MAX_MEMORY_HEAPS> image_heaps{};     ///< Device-local heaps (images).
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
 

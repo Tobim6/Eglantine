@@ -94,16 +94,26 @@ namespace {
     // Buffers had no fallback when device memory ran out: the VK_ERROR_OUT_OF_DEVICE_MEMORY from
     // vk::Check left the GPU thread and ended the process (an 8 GB RX 580 in Ocarina of Time).
     // Like images: allow going over the budget, then use host memory, and only then fail.
+    // first_types: memory types to try first, within the budget (0: none).
     VkResult CreateBufferWithFallback(VmaAllocator allocator, const VkBufferCreateInfo& ci,
                                       const VmaAllocationCreateInfo& alloc_ci,
                                       VkDeviceSize min_alignment, VkBuffer& handle,
-                                      VmaAllocation& allocation, VmaAllocationInfo& alloc_info) {
+                                      VmaAllocation& allocation, VmaAllocationInfo& alloc_info,
+                                      u32 first_types = 0) {
         const auto create = [&](const VmaAllocationCreateInfo& info) {
             return min_alignment > 1
                        ? vmaCreateBufferWithAlignment(allocator, &ci, &info, min_alignment, &handle,
                                                       &allocation, &alloc_info)
                        : vmaCreateBuffer(allocator, &ci, &info, &handle, &allocation, &alloc_info);
         };
+        if (first_types != 0) {
+            VmaAllocationCreateInfo first = alloc_ci;
+            first.memoryTypeBits = (alloc_ci.memoryTypeBits != 0 ? alloc_ci.memoryTypeBits : ~0u) &
+                                   first_types;
+            if (first.memoryTypeBits != 0 && create(first) == VK_SUCCESS) {
+                return VK_SUCCESS;
+            }
+        }
         VkResult result = create(alloc_ci);
         if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
             return result;
@@ -255,6 +265,29 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
             }
         });
     }
+    // A discrete GPU with both CPU-visible device-local memory (resizable BAR: an RX 580 8 GB
+    // with a 2 GiB BAR has a 6 GiB heap and a 2 GiB one) and memory only the GPU sees: images and
+    // GPU-only buffers go to the latter first. All of it is one video memory pool
+    // (Device::GetDeviceMemoryBudget); the BAR memory is taken by them only once the rest is full,
+    // so CPU-written buffers (MemoryUsage::Stream) keep it until then.
+    if (!device.IsIntegrated()) {
+        u32 gpu_only{};
+        u32 cpu_visible{};
+        for (u32 t = 0; t < properties.memoryTypeCount; ++t) {
+            const VkMemoryPropertyFlags flags = properties.memoryTypes[t].propertyFlags;
+            if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+                continue;
+            }
+            if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+                cpu_visible |= 1u << t;
+            } else {
+                gpu_only |= 1u << t;
+            }
+        }
+        if (gpu_only != 0 && (cpu_visible & valid_memory_types) != 0) {
+            gpu_only_types = gpu_only & valid_memory_types;
+        }
+    }
 }
 
 MemoryAllocator::~MemoryAllocator() = default;
@@ -297,8 +330,16 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         huge = ShouldLeaveImageUnbacked(texels, requirements.size,
                                         device.GetDeviceLocalMemory());
     }
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!huge && gpu_only_types != 0) {
+        // Video memory the CPU cannot see first; the resizable BAR heap once it is full.
+        VmaAllocationCreateInfo gpu_only = alloc_ci;
+        gpu_only.memoryTypeBits = gpu_only_types;
+        result = vmaCreateImage(allocator, &ci, &gpu_only, &handle, &allocation, &alloc_info);
+    }
+    if (!huge && result != VK_SUCCESS) {
+        result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -488,9 +529,15 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
+    // GPU-only buffers: video memory the CPU cannot see first (see gpu_only_types).
+    const u32 first_types = usage == MemoryUsage::DeviceLocal ? gpu_only_types : 0u;
+    VmaAllocationCreateInfo pool_alloc_ci = alloc_ci;
+    if (first_types != 0) {
+        pool_alloc_ci.memoryTypeBits = alloc_ci.memoryTypeBits & first_types;
+    }
+    if (!CreateBufferInSeparatePool(ci, usage, pool_alloc_ci, handle, allocation, alloc_info)) {
         vk::Check(CreateBufferWithFallback(allocator, ci, alloc_ci, 1, handle, allocation,
-                                           alloc_info));
+                                           alloc_info, first_types));
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
@@ -548,7 +595,8 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     vk::Check(CreateBufferWithFallback(allocator, ci, alloc_ci, min_alignment, handle,
-                                       allocation, alloc_info));
+                                       allocation, alloc_info,
+                                       usage == MemoryUsage::DeviceLocal ? gpu_only_types : 0u));
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
@@ -580,7 +628,16 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     VmaAllocation a{};
     VmaAllocationInfo info{};
 
-    VkResult res = vmaAllocateMemory(allocator, &reqs, &ci, &a, &info);
+    VkResult res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (usage == MemoryUsage::DeviceLocal && (ci.memoryTypeBits & gpu_only_types) != 0) {
+        // Video memory the CPU cannot see first (see gpu_only_types).
+        VmaAllocationCreateInfo gpu_only = ci;
+        gpu_only.memoryTypeBits &= gpu_only_types;
+        res = vmaAllocateMemory(allocator, &reqs, &gpu_only, &a, &info);
+    }
+    if (res != VK_SUCCESS) {
+        res = vmaAllocateMemory(allocator, &reqs, &ci, &a, &info);
+    }
 
     if (res != VK_SUCCESS) {
         // Relax 1: drop budget constraint
