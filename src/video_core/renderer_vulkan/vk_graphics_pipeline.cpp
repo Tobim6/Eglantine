@@ -938,16 +938,6 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (!before_pass) {
             scheduler.RequestOutsideRenderPassOperationContext();
         }
-        const auto record_outside = [&](auto&& command) {
-            if (before_pass) {
-                scheduler.RecordBeforeRenderPass(
-                    mesh_emulation->has_task ? Scheduler::PrePassStage::Task
-                                             : Scheduler::PrePassStage::Mesh,
-                    std::move(command));
-            } else {
-                scheduler.Record(std::move(command));
-            }
-        };
         if (before_pass) {
             // Before the pass: the same programs, one command per stage, without barriers of
             // their own (the scheduler puts one between stages for all the pass's draws).
