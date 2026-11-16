@@ -286,8 +286,36 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
         }
         if (gpu_only != 0 && (cpu_visible & valid_memory_types) != 0) {
             gpu_only_types = gpu_only & valid_memory_types;
+            cpu_visible_types = cpu_visible & valid_memory_types;
         }
     }
+}
+
+u32 MemoryAllocator::FirstTypes() const {
+    using namespace Common::Literals;
+    if (gpu_only_types == 0) {
+        return 0;
+    }
+    // Room kept free in the heap the CPU cannot see, for blocks VMA may still create there.
+    constexpr VkDeviceSize Headroom = 128_MiB;
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    for (u32 t = 0; t < properties.memoryTypeCount; ++t) {
+        if ((gpu_only_types & (1u << t)) == 0) {
+            continue;
+        }
+        const VmaBudget& budget = budgets[properties.memoryTypes[t].heapIndex];
+        // What is allocated in the heap, not only what the driver reports: Windows moves the
+        // allocations of an over-committed heap to system memory, and the reported usage then
+        // drops below it, so VMA's within-budget check kept adding blocks (RX 580 8 GB with a 2 GiB
+        // BAR: 5855 MiB of blocks, 5318 MiB of usage, a 5262 MiB budget, then vkQueueSubmit out
+        // of device memory while 1.35 GiB of the BAR heap was free).
+        const VkDeviceSize used = (std::max)(budget.usage, budget.statistics.blockBytes);
+        if (used + Headroom > budget.budget) {
+            return cpu_visible_types;
+        }
+    }
+    return gpu_only_types;
 }
 
 MemoryAllocator::~MemoryAllocator() = default;
@@ -331,11 +359,11 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                                         device.GetDeviceLocalMemory());
     }
     VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    if (!huge && gpu_only_types != 0) {
+    if (const u32 first_types = huge ? 0u : FirstTypes(); first_types != 0) {
         // Video memory the CPU cannot see first; the resizable BAR heap once it is full.
-        VmaAllocationCreateInfo gpu_only = alloc_ci;
-        gpu_only.memoryTypeBits = gpu_only_types;
-        result = vmaCreateImage(allocator, &ci, &gpu_only, &handle, &allocation, &alloc_info);
+        VmaAllocationCreateInfo first = alloc_ci;
+        first.memoryTypeBits = first_types;
+        result = vmaCreateImage(allocator, &ci, &first, &handle, &allocation, &alloc_info);
     }
     if (!huge && result != VK_SUCCESS) {
         result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
@@ -530,7 +558,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     // GPU-only buffers: video memory the CPU cannot see first (see gpu_only_types).
-    const u32 first_types = usage == MemoryUsage::DeviceLocal ? gpu_only_types : 0u;
+    const u32 first_types = usage == MemoryUsage::DeviceLocal ? FirstTypes() : 0u;
     VmaAllocationCreateInfo pool_alloc_ci = alloc_ci;
     if (first_types != 0) {
         pool_alloc_ci.memoryTypeBits = alloc_ci.memoryTypeBits & first_types;
@@ -596,7 +624,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
 
     vk::Check(CreateBufferWithFallback(allocator, ci, alloc_ci, min_alignment, handle,
                                        allocation, alloc_info,
-                                       usage == MemoryUsage::DeviceLocal ? gpu_only_types : 0u));
+                                       usage == MemoryUsage::DeviceLocal ? FirstTypes() : 0u));
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
@@ -629,11 +657,12 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     VmaAllocationInfo info{};
 
     VkResult res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    if (usage == MemoryUsage::DeviceLocal && (ci.memoryTypeBits & gpu_only_types) != 0) {
-        // Video memory the CPU cannot see first (see gpu_only_types).
-        VmaAllocationCreateInfo gpu_only = ci;
-        gpu_only.memoryTypeBits &= gpu_only_types;
-        res = vmaAllocateMemory(allocator, &reqs, &gpu_only, &a, &info);
+    if (const u32 first_types = usage == MemoryUsage::DeviceLocal ? FirstTypes() : 0u;
+        (ci.memoryTypeBits & first_types) != 0) {
+        // Video memory the CPU cannot see first (see FirstTypes).
+        VmaAllocationCreateInfo first = ci;
+        first.memoryTypeBits &= first_types;
+        res = vmaAllocateMemory(allocator, &reqs, &first, &a, &info);
     }
     if (res != VK_SUCCESS) {
         res = vmaAllocateMemory(allocator, &reqs, &ci, &a, &info);

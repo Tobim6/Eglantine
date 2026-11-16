@@ -175,6 +175,12 @@ namespace Vulkan {
         /// ones (resizable BAR); 0 otherwise. Images and GPU-only buffers try these first, so the
         /// BAR memory stays for CPU-written buffers until the rest of the video memory is full.
         u32 gpu_only_types{};
+        /// The CPU-visible device-local memory types (resizable BAR) when gpu_only_types is set.
+        u32 cpu_visible_types{};
+
+        /// The memory types a GPU-only allocation tries first: gpu_only_types while their heaps
+        /// are under budget, cpu_visible_types once they are not; 0 for no preference.
+        u32 FirstTypes() const;
         mutable std::atomic<u32> pressure_events{0};
         mutable std::mutex buffer_type_mutex;
         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).

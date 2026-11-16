@@ -424,7 +424,11 @@ std::filesystem::path StaticPipelineCacheFilename() {
 u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     const VmaStatistics& statistics = vma_budget.statistics;
     const u64 unused = statistics.blockBytes - statistics.allocationBytes;
-    return driver_usage - (std::min)(driver_usage, unused);
+    // At least what is allocated: Windows moves the allocations of an over-committed heap to
+    // system memory, and the driver's usage then drops below them (5318 MiB reported with 5855
+    // MiB of blocks); counting only that let the texture cache keep filling the heap.
+    const u64 used = (std::max)(u64{driver_usage}, u64{statistics.blockBytes});
+    return used - (std::min)(used, unused);
 }
 
 } // Anonymous namespace
