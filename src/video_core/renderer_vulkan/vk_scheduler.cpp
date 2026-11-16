@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -673,10 +674,69 @@ void Scheduler::ReleasePass() {
     if (!chunk->Empty()) {
         pass_chunks.push_back(std::move(chunk));
     }
+    // The barriers around and between the stages of the work recorded before the pass.
+    const auto barrier_chunk = [this](VkAccessFlags src_access, VkAccessFlags dst_access,
+                                      VkPipelineStageFlags src_stages,
+                                      VkPipelineStageFlags dst_stages) {
+        std::unique_ptr<CommandChunk> barrier = TakeReserveChunk();
+        auto command = [src_access, dst_access, src_stages, dst_stages](vk::CommandBuffer cmdbuf,
+                                                                        vk::CommandBuffer) {
+            const VkMemoryBarrier memory_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = src_access,
+                .dstAccessMask = dst_access,
+            };
+            cmdbuf.PipelineBarrier(src_stages, dst_stages, 0, memory_barrier);
+        };
+        (void)barrier->Record(command);
+        return barrier;
+    };
+    std::vector<std::unique_ptr<CommandChunk>> pre_pass;
+    bool any_stage = false;
+    for (size_t stage = 0; stage < pre_pass_chunks.size(); ++stage) {
+        auto& chunks = pre_pass_chunks[stage];
+        if (chunks.empty()) {
+            continue;
+        }
+        if (!any_stage) {
+            // The programs read what earlier passes, dispatches and copies wrote (foliage
+            // instance lists, for one).
+            pre_pass.push_back(barrier_chunk(
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT));
+        } else {
+            // The distribution reads the task output and writes the mesh dispatch and draw
+            // arguments (and the arena counter the host reads after the submission).
+            pre_pass.push_back(barrier_chunk(
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
+                    VK_ACCESS_HOST_READ_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                    VK_PIPELINE_STAGE_HOST_BIT));
+        }
+        any_stage = true;
+        for (auto& held : chunks) {
+            pre_pass.push_back(std::move(held));
+        }
+        chunks.clear();
+    }
+    if (any_stage) {
+        // The pass's draws read the mesh output in their vertex shaders, and their vertex
+        // counts as indirect arguments.
+        pre_pass.push_back(barrier_chunk(
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
+                VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT));
+    }
     bool wake;
     {
         std::scoped_lock ql{queue_mutex};
-        for (auto* list : {&before_pass_chunks, &pre_pass_chunks, &pass_chunks}) {
+        for (auto* list : {&before_pass_chunks, &pre_pass, &pass_chunks}) {
             for (auto& held : *list) {
                 work_queue.push(std::move(held));
             }

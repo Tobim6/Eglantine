@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -234,16 +235,28 @@ public:
                deferred_clear.framebuffer == nullptr;
     }
 
-    /// Records work that runs before the active render pass begins (CanRecordBeforeRenderPass).
+    /// Stages of the work recorded before a render pass. The work of all a pass's emulated mesh
+    /// draws runs stage by stage, with one barrier between stages (not 2-4 per draw).
+    enum class PrePassStage : u32 {
+        Task = 0,         ///< task program dispatches
+        Distribution = 1, ///< task -> mesh distribution dispatches (read the task output)
+        Mesh = 2,         ///< mesh program dispatches (read the distribution output)
+    };
+
+    /// Records work that runs before the active render pass begins (CanRecordBeforeRenderPass),
+    /// in the given stage. Barriers: before the first stage (everything earlier written ->
+    /// compute), between the stages (compute -> compute, indirect, host) and after the last
+    /// (compute -> vertex input, vertex shader, indirect).
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
-    void RecordBeforeRenderPass(T&& c) {
+    void RecordBeforeRenderPass(PrePassStage stage, T&& c) {
         auto command = [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
             command(cmdbuf);
         };
-        if (pre_pass_chunks.empty() || !pre_pass_chunks.back()->Record(command)) {
-            pre_pass_chunks.push_back(TakeReserveChunk());
-            (void)pre_pass_chunks.back()->Record(command);
+        auto& chunks = pre_pass_chunks[static_cast<size_t>(stage)];
+        if (chunks.empty() || !chunks.back()->Record(command)) {
+            chunks.push_back(TakeReserveChunk());
+            (void)chunks.back()->Record(command);
         }
     }
 
@@ -472,7 +485,7 @@ private:
     // targets on an RX 580).
     bool pass_held{};
     std::vector<std::unique_ptr<CommandChunk>> before_pass_chunks;
-    std::vector<std::unique_ptr<CommandChunk>> pre_pass_chunks;
+    std::array<std::vector<std::unique_ptr<CommandChunk>>, 3> pre_pass_chunks;
     std::vector<std::unique_ptr<CommandChunk>> pass_chunks;
     /// Holds the render pass about to begin (BeginRenderPassImpl).
     void HoldPass();
