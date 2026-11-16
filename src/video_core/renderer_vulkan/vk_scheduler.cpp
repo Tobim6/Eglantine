@@ -166,6 +166,9 @@ void Scheduler::DispatchWork() {
         // The worker must receive everything recorded so far.
         FlushUploads();
     }
+    if (pass_held) {
+        ReleasePass();
+    }
     if (chunk && !chunk->Empty()) {
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
         // draws): skip it while the worker is still busy, it pops the queue before waiting.
@@ -225,6 +228,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
         values[i] = clear_values[i];
     }
     const bool after_compute = std::exchange(compute_writes_pending, false);
+    HoldPass();
     Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
             after_compute](vk::CommandBuffer cmdbuf) {
         const VkRenderPassBeginInfo renderpass_bi{
@@ -603,19 +607,88 @@ void Scheduler::EndRenderPass()
 
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
+        if (pass_held) {
+            ReleasePass();
+        }
     }
 
 
 void Scheduler::AcquireNewChunk() {
+    chunk = TakeReserveChunk();
+}
+
+std::unique_ptr<Scheduler::CommandChunk> Scheduler::TakeReserveChunk() {
     std::scoped_lock rl{reserve_mutex};
 
     if (chunk_reserve.empty()) {
         // If we don't have anything reserved, we need to make a new chunk.
-        chunk = std::make_unique<CommandChunk>();
-    } else {
-        // Otherwise, we can just take from the reserve.
-        chunk = std::move(chunk_reserve.back());
-        chunk_reserve.pop_back();
+        return std::make_unique<CommandChunk>();
+    }
+    // Otherwise, we can just take from the reserve.
+    std::unique_ptr<CommandChunk> reserved = std::move(chunk_reserve.back());
+    chunk_reserve.pop_back();
+    return reserved;
+}
+
+namespace {
+bool PassHoldEnabled() {
+    // EDEN_NX2_MESH_HOIST=0: end the render pass at every emulated mesh draw, as before.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MESH_HOIST");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // namespace
+
+void Scheduler::HoldPass() {
+    // Only without VK_EXT_mesh_shader: mesh draws are emulated with compute dispatches then.
+    if (!PassHoldEnabled() || device.IsExtMeshShaderSupported()) {
+        return;
+    }
+    if (pass_held) {
+        ReleasePass();
+    }
+    if (!chunk->Empty()) {
+        before_pass_chunks.push_back(std::move(chunk));
+        AcquireNewChunk();
+    }
+    pass_held = true;
+}
+
+bool Scheduler::HoldFullPassChunk() {
+    // About 256 KiB of commands: past that the worker would sit idle too long behind the pass.
+    static constexpr size_t MaxHeldPassChunks = 8;
+    if (pass_chunks.size() >= MaxHeldPassChunks) {
+        ReleasePass();
+        return false;
+    }
+    pass_chunks.push_back(std::move(chunk));
+    AcquireNewChunk();
+    return true;
+}
+
+void Scheduler::ReleasePass() {
+    pass_held = false;
+    if (!chunk->Empty()) {
+        pass_chunks.push_back(std::move(chunk));
+    }
+    bool wake;
+    {
+        std::scoped_lock ql{queue_mutex};
+        for (auto* list : {&before_pass_chunks, &pre_pass_chunks, &pass_chunks}) {
+            for (auto& held : *list) {
+                work_queue.push(std::move(held));
+            }
+            list->clear();
+        }
+        wake = worker_waiting;
+    }
+    if (wake) {
+        event_cv.notify_all();
+    }
+    if (!chunk) {
+        AcquireNewChunk();
     }
 }
 

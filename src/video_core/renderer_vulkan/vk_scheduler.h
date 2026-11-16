@@ -218,8 +218,33 @@ public:
         if (chunk->Record(command)) {
             return;
         }
+        if (pass_held && HoldFullPassChunk()) {
+            (void)chunk->Record(command);
+            return;
+        }
         DispatchWork();
         (void)chunk->Record(command);
+    }
+
+    /// Whether work recorded with RecordBeforeRenderPass runs before the render pass that is
+    /// active on `framebuffer` (mesh emulation dispatches then do not end it).
+    [[nodiscard]] bool CanRecordBeforeRenderPass(VkFramebuffer framebuffer) const {
+        return pass_held && state.renderpass != VK_NULL_HANDLE &&
+               state.framebuffer == framebuffer && !render_pass_has_stores &&
+               deferred_clear.framebuffer == nullptr;
+    }
+
+    /// Records work that runs before the active render pass begins (CanRecordBeforeRenderPass).
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordBeforeRenderPass(T&& c) {
+        auto command = [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+            command(cmdbuf);
+        };
+        if (pre_pass_chunks.empty() || !pre_pass_chunks.back()->Record(command)) {
+            pre_pass_chunks.push_back(TakeReserveChunk());
+            (void)pre_pass_chunks.back()->Record(command);
+        }
     }
 
     template <typename T>
@@ -435,6 +460,27 @@ private:
     void EndRenderPass();
 
     void AcquireNewChunk();
+
+    /// A chunk from the reserve (or a new one).
+    std::unique_ptr<CommandChunk> TakeReserveChunk();
+
+    // Held render passes: the work before a render pass, the pass itself and the work recorded
+    // before it (RecordBeforeRenderPass) go to the worker together when the pass ends, in the
+    // order: work before the pass, work before the pass recorded during it, the pass. Mesh
+    // emulation dispatches then run before the pass instead of ending it at every emulated draw
+    // (Ocarina of Time: 150-300 of them a frame, each one a load and store of the 2560x1440
+    // targets on an RX 580).
+    bool pass_held{};
+    std::vector<std::unique_ptr<CommandChunk>> before_pass_chunks;
+    std::vector<std::unique_ptr<CommandChunk>> pre_pass_chunks;
+    std::vector<std::unique_ptr<CommandChunk>> pass_chunks;
+    /// Holds the render pass about to begin (BeginRenderPassImpl).
+    void HoldPass();
+    /// The current chunk is full while a pass is held: keep it in the pass. False (and the pass
+    /// is released) when the pass has grown too large to keep holding.
+    bool HoldFullPassChunk();
+    /// Sends the held work to the worker in order; the rest of the pass is not held.
+    void ReleasePass();
 
     const Device& device;
     StateTracker& state_tracker;
