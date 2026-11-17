@@ -112,6 +112,18 @@ void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();
 void SetCurrentThreadToAllCores();
 
+/// The emulated GPU's busiest threads, each given a physical core of its own.
+enum class ReservedCore : u32 {
+    GpuBack = 0,  ///< The split GPU thread's back (register state, draws)
+    GpuFront = 1, ///< The GPU thread (the split's front: command lists, macros)
+    VulkanWorker = 2,
+};
+
+/// Moves the calling thread to a physical core no other thread of the process runs on, its
+/// hyperthread sibling left idle (Windows; EDEN_NX2_RESERVE_CORES=0 turns it off). Does nothing
+/// when the CPU has too few cores for it (three reserved from 8 cores, two from 6).
+void ReserveCoreForCurrentThread(ReservedCore slot);
+
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 

@@ -8,6 +8,7 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -1010,6 +1011,128 @@ void SetCurrentThreadToBackgroundWork() {
     }
 #elif defined(__linux__)
     SetCurrentThreadLinuxGroup(LinuxCoreGroup::Efficiency);
+#endif
+}
+
+#ifdef _WIN32
+namespace {
+
+struct ReservedCores {
+    /// One logical processor (CPU set id) per slot, on a core nothing else of the process uses.
+    std::vector<ULONG> slots;
+};
+
+const ReservedCores& GetReservedCores() {
+    static const ReservedCores reserved = [] {
+        ReservedCores result;
+        if (const char* value = std::getenv("EDEN_NX2_RESERVE_CORES");
+            value != nullptr && value[0] == '0') {
+            LOG_INFO(Common, "Reserved GPU thread cores off (EDEN_NX2_RESERVE_CORES=0)");
+            return result;
+        }
+        using PFN_GetSystemCpuSetInformation = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG,
+                                                             PULONG, HANDLE, ULONG);
+        using PFN_SetProcessDefaultCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+        const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        const auto get = reinterpret_cast<PFN_GetSystemCpuSetInformation>(
+            reinterpret_cast<void*>(GetProcAddress(kernel32, "GetSystemCpuSetInformation")));
+        const auto set_default = reinterpret_cast<PFN_SetProcessDefaultCpuSets>(
+            reinterpret_cast<void*>(GetProcAddress(kernel32, "SetProcessDefaultCpuSets")));
+        if (get == nullptr || set_default == nullptr) {
+            return result;
+        }
+        ULONG length = 0;
+        get(nullptr, 0, &length, GetCurrentProcess(), 0);
+        if (length == 0) {
+            return result;
+        }
+        std::vector<u8> buffer(length);
+        if (!get(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), length, &length,
+                 GetCurrentProcess(), 0)) {
+            return result;
+        }
+        struct Entry {
+            ULONG id;
+            u32 core; ///< Group << 8 | CoreIndex
+            u8 logical;
+            u8 efficiency_class;
+        };
+        std::vector<Entry> entries;
+        u8 best = 0;
+        for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
+            const auto* info =
+                reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+            if (info->Size == 0) {
+                break;
+            }
+            if (info->Type == CpuSetInformation) {
+                entries.push_back({info->CpuSet.Id,
+                                   (u32{info->CpuSet.Group} << 8) | info->CpuSet.CoreIndex,
+                                   info->CpuSet.LogicalProcessorIndex,
+                                   info->CpuSet.EfficiencyClass});
+                best = (std::max)(best, static_cast<u8>(info->CpuSet.EfficiencyClass));
+            }
+            offset += info->Size;
+        }
+        // The performance cores, in order; core 0 (most interrupts land there) is never taken.
+        std::vector<u32> cores;
+        for (const Entry& entry : entries) {
+            if (entry.efficiency_class == best &&
+                std::find(cores.begin(), cores.end(), entry.core) == cores.end()) {
+                cores.push_back(entry.core);
+            }
+        }
+        std::sort(cores.begin(), cores.end());
+        const size_t count = cores.size() >= 8 ? 3 : cores.size() >= 6 ? 2 : 0;
+        if (count == 0) {
+            LOG_INFO(Common, "Reserved GPU thread cores: {} performance cores, too few",
+                     cores.size());
+            return result;
+        }
+        const std::vector<u32> taken(cores.begin() + 1, cores.begin() + 1 + count);
+        std::vector<ULONG> others;
+        for (const u32 core : taken) {
+            const Entry* first = nullptr;
+            for (const Entry& entry : entries) {
+                if (entry.core == core && (first == nullptr || entry.logical < first->logical)) {
+                    first = &entry;
+                }
+            }
+            result.slots.push_back(first->id);
+        }
+        for (const Entry& entry : entries) {
+            if (std::find(taken.begin(), taken.end(), entry.core) == taken.end()) {
+                others.push_back(entry.id);
+            }
+        }
+        // Every other thread of the process (those without a selection of their own, new ones
+        // too) stays off the reserved cores, both hyperthreads of each.
+        if (!set_default(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size()))) {
+            LOG_WARNING(Common, "SetProcessDefaultCpuSets failed: {}", Common::GetLastErrorMsg());
+            result.slots.clear();
+            return result;
+        }
+        LOG_INFO(Common,
+                 "Reserved GPU thread cores: {} of {} performance cores (GPU back, GPU front{}), "
+                 "the other {} logical processors for the rest",
+                 count, cores.size(), count > 2 ? ", Vulkan worker" : "", others.size());
+        return result;
+    }();
+    return reserved;
+}
+
+} // Anonymous namespace
+#endif
+
+void ReserveCoreForCurrentThread(ReservedCore slot) {
+#ifdef _WIN32
+    const ReservedCores& reserved = GetReservedCores();
+    const size_t index = static_cast<size_t>(slot);
+    if (index < reserved.slots.size()) {
+        SelectCurrentThreadCpuSets({reserved.slots[index]});
+    }
+#else
+    (void)slot;
 #endif
 }
 

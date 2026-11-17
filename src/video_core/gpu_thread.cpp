@@ -179,6 +179,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         VideoCommon::GpuSplit::MarkGpuThread();
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
+        Common::ReserveCoreForCurrentThread(Common::ReservedCore::GpuFront);
         system.RegisterHostThread();
 
         auto current_context = context.Acquire();
